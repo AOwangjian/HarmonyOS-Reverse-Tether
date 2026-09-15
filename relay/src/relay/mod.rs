@@ -30,6 +30,7 @@ mod ipv4_header;
 mod ipv4_packet;
 mod ipv4_packet_buffer;
 mod net;
+mod root_listener;
 mod packet_source;
 mod packetizer;
 #[allow(clippy::module_inception)] // relay.rs is in relay/

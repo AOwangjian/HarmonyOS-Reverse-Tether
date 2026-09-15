@@ -2,6 +2,10 @@
 mod logger;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--network-quality-capabilities") {
+        println!("root-listener-v1");
+        return;
+    }
     let mut args = std::env::args().skip(1);
     let mut port = 31417;
     let mut dns = None;
