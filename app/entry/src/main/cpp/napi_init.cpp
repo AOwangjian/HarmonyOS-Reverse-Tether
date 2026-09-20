@@ -19,9 +19,17 @@ napi_value Error(napi_env env, const std::string &message) {
     napi_throw_error(env, nullptr, message.c_str());
     return nullptr;
 }
+// Upper bound of `required` across every exported function. The buffer must be
+// able to hold every argument the caller asks for: a smaller one leaves the tail
+// of `args` uninitialised and the loop below then reads past the end.
+constexpr size_t MAX_ARGS = 4;
+
 bool Args(napi_env env, napi_callback_info info, size_t required, int32_t *values) {
-    size_t count = 3;
-    napi_value args[3];
+    if (required > MAX_ARGS) {
+        Error(env, "Too many arguments requested"); return false;
+    }
+    size_t count = MAX_ARGS;
+    napi_value args[MAX_ARGS];
     if (napi_get_cb_info(env, info, &count, args, nullptr, nullptr) != napi_ok || count != required) {
         Error(env, "Invalid argument count"); return false;
     }
