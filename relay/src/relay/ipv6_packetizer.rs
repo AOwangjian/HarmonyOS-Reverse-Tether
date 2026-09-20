@@ -292,6 +292,61 @@ mod tests {
         assert_eq!(0xffff, verify(&short, 17));
     }
 
+    /// Mirrors `Ipv6Checksum` in app/entry/src/main/cpp/icmpv6.cpp.
+    ///
+    /// The app cannot run unit tests, so the shared folding rule is pinned here:
+    /// a receiver folding a correct packet always arrives at 0xffff.
+    fn icmpv6_checksum(source: &[u8], destination: &[u8], payload: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for index in (0..16).step_by(2) {
+            sum += u32::from(u16::from_be_bytes([source[index], source[index + 1]]));
+            sum += u32::from(u16::from_be_bytes([destination[index], destination[index + 1]]));
+        }
+        sum += payload.len() as u32;
+        sum += 58; // ICMPv6
+        let mut chunks = payload.chunks_exact(2);
+        for pair in &mut chunks {
+            sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+        if let Some(&last) = chunks.remainder().first() {
+            sum += u32::from(last) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    #[test]
+    fn icmpv6_checksum_folds_to_all_ones_at_the_receiver() {
+        let source = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let destination = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        // Type 1, code 1, zeroed checksum, unused word, then an odd-length quote.
+        let mut icmp = vec![1u8, 1, 0, 0, 0, 0, 0, 0, 0x60, 0x11, 0x22];
+        let checksum = icmpv6_checksum(&source, &destination, &icmp);
+        icmp[2] = (checksum >> 8) as u8;
+        icmp[3] = (checksum & 0xff) as u8;
+
+        let mut verify = 0u32;
+        for index in (0..16).step_by(2) {
+            verify += u32::from(u16::from_be_bytes([source[index], source[index + 1]]));
+            verify += u32::from(u16::from_be_bytes([destination[index], destination[index + 1]]));
+        }
+        verify += icmp.len() as u32;
+        verify += 58;
+        let mut chunks = icmp.chunks_exact(2);
+        for pair in &mut chunks {
+            verify += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+        }
+        if let Some(&last) = chunks.remainder().first() {
+            verify += u32::from(last) << 8;
+        }
+        while verify >> 16 != 0 {
+            verify = (verify & 0xffff) + (verify >> 16);
+        }
+        assert_eq!(0xffff, verify as u16);
+    }
+
     #[test]
     fn endpoints_are_swapped_towards_the_client() {
         let udp = [0x04, 0xd2, 0x16, 0x2e, 0, 8, 0, 0];
