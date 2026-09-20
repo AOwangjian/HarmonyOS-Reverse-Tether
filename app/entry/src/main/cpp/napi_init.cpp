@@ -98,10 +98,12 @@ napi_value Connect(napi_env env, napi_callback_info info) {
 
 napi_value Start(napi_env env, napi_callback_info info) {
     std::lock_guard<std::mutex> lock(sessionMutex);
-    int32_t values[3];
-    if (!Args(env, info, 3, values)) return nullptr;
+    int32_t values[4];
+    if (!Args(env, info, 4, values)) return nullptr;
     if (values[2] != currentSession) return Error(env, "Stale VPN session");
-    if (!tunnel.Start(values[0], values[1])) return Error(env, "Cannot start tunnel: " + tunnel.Status());
+    if (values[3] < 0 || values[3] > 2) return Error(env, "Invalid IPv6 mode");
+    const tether::Ipv6Mode mode = static_cast<tether::Ipv6Mode>(values[3]);
+    if (!tunnel.Start(values[0], values[1], mode)) return Error(env, "Cannot start tunnel: " + tunnel.Status());
     return Undefined(env);
 }
 napi_value Stop(napi_env env, napi_callback_info info) {
