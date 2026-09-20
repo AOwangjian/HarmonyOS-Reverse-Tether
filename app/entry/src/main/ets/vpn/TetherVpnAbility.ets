@@ -84,11 +84,24 @@ export default class TetherVpnAbility extends VpnExtensionAbility {
       await tether.connect(this.socketFd, this.port);
       if (this.stopped || generation !== this.generation) { await this.cleanup(); return; }
       const config: vpnExtension.VpnConfig = {
-        addresses: [{address: {address: '10.0.0.2', family: 1}, prefixLength: 32}],
+        addresses: [
+          {address: {address: '10.0.0.2', family: 1}, prefixLength: 32},
+          // ULA endpoint for the tunnel. The relay mirrors this address when it
+          // synthesizes responses, so it never appears on the public wire.
+          {address: {address: 'fd00::2', family: 2}, prefixLength: 128}
+        ],
         routes: [{
           interface: 'vpn-tun',
           destination: {address: {address: '0.0.0.0', family: 1}, prefixLength: 0},
           gateway: {address: '0.0.0.0', family: 1},
+          hasGateway: false,
+          isDefaultRoute: true
+        }, {
+          // Capture IPv6 too: without this route the system keeps sending IPv6
+          // around the tunnel and the relay never sees those packets.
+          interface: 'vpn-tun',
+          destination: {address: {address: '::', family: 2}, prefixLength: 0},
+          gateway: {address: '::', family: 2},
           hasGateway: false,
           isDefaultRoute: true
         }],
@@ -96,7 +109,7 @@ export default class TetherVpnAbility extends VpnExtensionAbility {
         dnsAddresses: [this.dnsAddress],
         mtu: 1500,
         isIPv4Accepted: true,
-        isIPv6Accepted: false,
+        isIPv6Accepted: true,
         isBlocking: false
       };
       this.tunFd = await this.connection.create(config);

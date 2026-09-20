@@ -115,6 +115,58 @@ void Tunnel::Stop() {
 
 void Tunnel::Fail(int code) { error_ = code; }
 
+namespace {
+
+constexpr size_t kIpv4HeaderLength = 20;
+constexpr size_t kIpv6HeaderLength = 40;
+
+// Total on-the-wire size of the packet that starts at `data`.
+//
+// IPv4 carries a total length that already includes its header, while IPv6 carries
+// a payload length that excludes the 40-byte fixed header -- conflating the two
+// truncates every IPv6 packet by exactly 40 bytes.
+//
+// Returns false for a malformed packet. On success `*length` is the packet size, or
+// 0 when the header itself has not been fully buffered yet.
+bool IpPacketLength(const uint8_t *data, size_t available, size_t *length) {
+    const unsigned version = data[0] >> 4;
+    if (version == 4) {
+        if (available < kIpv4HeaderLength) { *length = 0; return true; }
+        const size_t header = (data[0] & 0x0f) * 4;
+        const size_t total = (size_t(data[2]) << 8) | data[3];
+        if (header < kIpv4HeaderLength || total < header) return false;
+        *length = total;
+        return true;
+    }
+    if (version == 6) {
+        if (available < kIpv6HeaderLength) { *length = 0; return true; }
+        const size_t payload = (size_t(data[4]) << 8) | data[5];
+        *length = kIpv6HeaderLength + payload;
+        return true;
+    }
+    return false;
+}
+
+// Validate a packet read from the tun device before forwarding it to the relay.
+bool IsWellFormedIpPacket(const uint8_t *data, size_t size) {
+    if (size < 4) return false;
+    const unsigned version = data[0] >> 4;
+    if (version == 4) {
+        if (size < kIpv4HeaderLength) return false;
+        const size_t header = (data[0] & 0x0f) * 4;
+        if (header < kIpv4HeaderLength || header > size) return false;
+        return ((size_t(data[2]) << 8) | data[3]) == size;
+    }
+    if (version == 6) {
+        if (size < kIpv6HeaderLength) return false;
+        // The relay rejects extension headers, so the payload length must match exactly.
+        return kIpv6HeaderLength + ((size_t(data[4]) << 8) | data[5]) == size;
+    }
+    return false;
+}
+
+}  // namespace
+
 std::string Tunnel::Status() {
     std::ostringstream out;
     out << "{\"state\":\"" << (running_ ? "running" : error_ ? "error" : "idle")
@@ -145,9 +197,7 @@ void Tunnel::Run(int tunFd, int socketFd) {
             ssize_t count = read(tun.value, buffer, sizeof(buffer));
             if (count > 0) {
                 size_t size = static_cast<size_t>(count);
-                size_t header = (buffer[0] & 0x0f) * 4;
-                if (size < 20 || buffer[0] >> 4 != 4 || header < 20 || header > size ||
-                    ((size_t(buffer[2]) << 8) | buffer[3]) != size) {
+                if (!IsWellFormedIpPacket(buffer, size)) {
                     ++dropped_;
                 } else {
                     if (sendOffset) {
@@ -175,10 +225,11 @@ void Tunnel::Run(int tunFd, int socketFd) {
             size_t offset = 0;
             while (incoming.size() - offset >= 4) {
                 const uint8_t *ip = incoming.data() + offset;
-                size_t header = (ip[0] & 0x0f) * 4;
-                size_t length = (size_t(ip[2]) << 8) | ip[3];
-                if (ip[0] >> 4 != 4 || header < 20 || length < header) { Fail(EPROTO); break; }
-                if (incoming.size() - offset < length) break;
+                size_t available = incoming.size() - offset;
+                size_t length = 0;
+                if (!IpPacketLength(ip, available, &length)) { Fail(EPROTO); break; }
+                if (length == 0) break;  // header not fully buffered yet
+                if (available < length) break;
                 packets.emplace_back(ip, ip + length);
                 queuedBytes += length;
                 offset += length;

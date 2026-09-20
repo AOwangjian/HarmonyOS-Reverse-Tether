@@ -3,7 +3,9 @@
     "signingConfigs": [],
     "products": [{
       "name": "default",
-      "compileSdkVersion": "5.1.0(18)",
+      // compileSdkVersion is intentionally omitted: pinning it breaks whenever the
+      // installed DevEco/CLT ships a newer built-in SDK, and the toolchain default
+      // already compiles against a compatible version.
       "compatibleSdkVersion": "5.0.0(12)",
       "targetSdkVersion": "5.1.0(18)",
       "runtimeOS": "HarmonyOS"

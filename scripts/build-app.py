@@ -28,16 +28,27 @@ def main():
     if not clt_home:
         parser.error('Set HARMONY_CLT_HOME to the extracted command-line-tools directory')
     clt = Path(clt_home).resolve()
-    for tool in ['ohpm', 'hvigorw']:
-        if not (clt / 'bin' / tool).is_file():
-            parser.error(f'Missing tool: {clt / "bin" / tool}')
+
+    def tool_path(name):
+        """Resolve a CLT launcher across platforms (Windows ships .bat wrappers)."""
+        for candidate in (clt / 'bin' / name, clt / 'bin' / f'{name}.bat'):
+            if candidate.is_file():
+                return candidate
+        parser.error(f'Missing tool: {clt / "bin" / name}')
+
+    ohpm = tool_path('ohpm')
+    hvigorw = tool_path('hvigorw')
     output = args.output.resolve()
     app_output = args.app_output.resolve() if args.app_output else None
     if app_output == output:
         parser.error('HAP and App Pack outputs must be different files')
     # A clean staging directory prevents private identity and generated state
     # from entering the source tree or being reused by a later default build.
-    with tempfile.TemporaryDirectory(prefix='harmony-tether-build-') as temporary:
+    # Cleanup is done manually: the ArkTS compiler cache nests paths deep enough to
+    # trip the Windows MAX_PATH limit, and TemporaryDirectory would then raise after
+    # the HAP has already been produced, masking a successful build as a failure.
+    temporary = tempfile.mkdtemp(prefix='harmony-tether-build-')
+    try:
         project = Path(temporary) / 'app'
         shutil.copytree(root / 'app', project, ignore=shutil.ignore_patterns(
             'build', '.hvigor', '.cxx', 'oh_modules', 'node_modules', '.idea',
@@ -47,13 +58,13 @@ def main():
         if args.bundle_name:
             manifest['app']['bundleName'] = args.bundle_name
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + '\n')
-        subprocess.run([str(clt / 'bin/ohpm'), 'install', '--all'], cwd=project, check=True)
-        command = [str(clt / 'bin/hvigorw'), '--mode', 'project' if app_output else 'module',
+        subprocess.run([str(ohpm), 'install', '--all'], cwd=project, check=True, shell=(os.name == 'nt'))
+        command = [str(hvigorw), '--mode', 'project' if app_output else 'module',
                    '-p', 'product=default', '-p', f'buildMode={args.mode}']
         if not app_output:
             command += ['-p', 'module=entry@default']
         command += ['assembleApp' if app_output else 'assembleHap', '--no-daemon']
-        subprocess.run(command, cwd=project, check=True)
+        subprocess.run(command, cwd=project, check=True, shell=(os.name == 'nt'))
         hap = project / 'entry/build/default/outputs/default/entry-default-unsigned.hap'
         products = [(hap, output)]
         if app_output:
@@ -63,6 +74,9 @@ def main():
             products.append((apps[0], app_output))
         for source, destination in products:
             copy_output(source, destination)
+    finally:
+        # Best effort: a stale staging tree is harmless, a masked build failure is not.
+        shutil.rmtree(temporary, ignore_errors=True)
     print(f'Build mode: {args.mode}')
     for _, destination in products:
         print(f'Unsigned package: {destination}')
