@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "tunnel.h"
+#include "icmpv6.h"
 #include <arpa/inet.h>
 #include <cerrno>
 #include <chrono>
@@ -82,7 +83,7 @@ int Connect(int fd, uint16_t port, uint32_t *clientId, uint32_t address) {
 
 Tunnel::~Tunnel() { Stop(); }
 
-bool Tunnel::Start(int tunFd, int socketFd) {
+bool Tunnel::Start(int tunFd, int socketFd, Ipv6Mode ipv6Mode) {
     Stop();
     int tun = dup(tunFd);
     int sock = dup(socketFd);
@@ -95,6 +96,7 @@ bool Tunnel::Start(int tunFd, int socketFd) {
     }
     stopping_ = false;
     error_ = 0;
+    ipv6Mode_ = ipv6Mode;
     txBytes_ = rxBytes_ = txPackets_ = rxPackets_ = dropped_ = 0;
     running_ = true;
     try {
@@ -165,6 +167,10 @@ bool IsWellFormedIpPacket(const uint8_t *data, size_t size) {
     return false;
 }
 
+bool IsIpv6(const uint8_t *data, size_t size) {
+    return size >= 1 && (data[0] >> 4) == 6;
+}
+
 }  // namespace
 
 std::string Tunnel::Status() {
@@ -197,8 +203,20 @@ void Tunnel::Run(int tunFd, int socketFd) {
             ssize_t count = read(tun.value, buffer, sizeof(buffer));
             if (count > 0) {
                 size_t size = static_cast<size_t>(count);
+                const Ipv6Mode mode = ipv6Mode_.load();
                 if (!IsWellFormedIpPacket(buffer, size)) {
                     ++dropped_;
+                } else if (IsIpv6(buffer, size) && mode != Ipv6Mode::Proxy) {
+                    // Refuse locally so the application falls back to IPv4 at once
+                    // instead of waiting out a TCP timeout.
+                    ++dropped_;
+                    std::vector<uint8_t> reply;
+                    if (mode == Ipv6Mode::Blackhole &&
+                        queuedBytes + MAX_PACKET < MAX_QUEUE &&
+                        BuildIcmpv6Unreachable(buffer, size, &reply)) {
+                        queuedBytes += reply.size();
+                        packets.emplace_back(std::move(reply));
+                    }
                 } else {
                     if (sendOffset) {
                         outbound.erase(outbound.begin(), outbound.begin() + sendOffset);

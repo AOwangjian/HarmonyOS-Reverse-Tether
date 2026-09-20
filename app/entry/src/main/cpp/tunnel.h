@@ -11,11 +11,13 @@ int CreateSocket();
 // Consumes the 4-byte gnirehtet client id; returns 0 or a positive errno.
 int Connect(int fd, uint16_t port, uint32_t *clientId = nullptr, uint32_t address = 0x7f000001);
 
+enum class Ipv6Mode : int32_t { Off = 0, Proxy = 1, Blackhole = 2 };
+
 class Tunnel {
 public:
     ~Tunnel();
     // Duplicates both fds. Caller retains ownership of the originals.
-    bool Start(int tunFd, int socketFd);
+    bool Start(int tunFd, int socketFd, Ipv6Mode ipv6Mode);
     void Stop();
     std::string Status();
 private:
@@ -26,5 +28,6 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<int> error_{0};
     std::atomic<uint64_t> txBytes_{0}, rxBytes_{0}, txPackets_{0}, rxPackets_{0}, dropped_{0};
+    std::atomic<Ipv6Mode> ipv6Mode_{Ipv6Mode::Off};
 };
 }
