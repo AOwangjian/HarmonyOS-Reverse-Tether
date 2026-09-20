@@ -5,6 +5,7 @@ import { Want } from '@kit.AbilityKit';
 import tether from 'libtether.so';
 import { PORT, TetherState, TunnelStats, saveState, loadState } from '../common/State';
 import { hasPrivacyConsent } from '../common/PrivacyConsent';
+import { Ipv6Mode, loadIpv6Mode, normalizeIpv6Mode } from '../common/Ipv6Settings';
 
 export default class TetherVpnAbility extends VpnExtensionAbility {
   private connection?: vpnExtension.VpnConnection;
@@ -19,6 +20,7 @@ export default class TetherVpnAbility extends VpnExtensionAbility {
   private state: TetherState = new TetherState();
   private dnsAddress: string = '10.0.0.3';
   private port: number = PORT;
+  private ipv6Mode: Ipv6Mode = Ipv6Mode.Off;
 
   onCreate(want: Want): void {
     if (!hasPrivacyConsent(this.context.filesDir)) {
@@ -48,6 +50,14 @@ export default class TetherVpnAbility extends VpnExtensionAbility {
         return;
       }
       this.dnsAddress = dns;
+    }
+    // Prefer the launch parameter; fall back to the stored setting, because the
+    // ability can also be started by HDC or restarted by the system.
+    const requestedMode = want.parameters?.ipv6Mode;
+    if (typeof requestedMode === 'string' || typeof requestedMode === 'number') {
+      this.ipv6Mode = normalizeIpv6Mode(Number(requestedMode));
+    } else {
+      this.ipv6Mode = loadIpv6Mode(this.context.filesDir);
     }
     this.stopped = false;
     this.timer = setInterval(() => this.tick(), 1000);
@@ -83,41 +93,46 @@ export default class TetherVpnAbility extends VpnExtensionAbility {
       if (this.stopped || generation !== this.generation) { await this.cleanup(); return; }
       await tether.connect(this.socketFd, this.port);
       if (this.stopped || generation !== this.generation) { await this.cleanup(); return; }
-      const config: vpnExtension.VpnConfig = {
-        addresses: [
-          {address: {address: '10.0.0.2', family: 1}, prefixLength: 32},
-          // ULA endpoint for the tunnel. The relay mirrors this address when it
-          // synthesizes responses, so it never appears on the public wire.
-          {address: {address: 'fd00::2', family: 2}, prefixLength: 128}
-        ],
-        routes: [{
-          interface: 'vpn-tun',
-          destination: {address: {address: '0.0.0.0', family: 1}, prefixLength: 0},
-          gateway: {address: '0.0.0.0', family: 1},
-          hasGateway: false,
-          isDefaultRoute: true
-        }, {
-          // Capture IPv6 too: without this route the system keeps sending IPv6
-          // around the tunnel and the relay never sees those packets.
+      const captureIpv6 = this.ipv6Mode !== Ipv6Mode.Off;
+      const addresses: vpnExtension.LinkAddress[] = [
+        {address: {address: '10.0.0.2', family: 1}, prefixLength: 32}
+      ];
+      const routes: vpnExtension.RouteInfo[] = [{
+        interface: 'vpn-tun',
+        destination: {address: {address: '0.0.0.0', family: 1}, prefixLength: 0},
+        gateway: {address: '0.0.0.0', family: 1},
+        hasGateway: false,
+        isDefaultRoute: true
+      }];
+      if (captureIpv6) {
+        // ULA endpoint for the tunnel. The relay mirrors this address when it
+        // synthesizes responses, so it never appears on the public wire.
+        addresses.push({address: {address: 'fd00::2', family: 2}, prefixLength: 128});
+        // Without this route the system keeps sending IPv6 around the tunnel.
+        routes.push({
           interface: 'vpn-tun',
           destination: {address: {address: '::', family: 2}, prefixLength: 0},
           gateway: {address: '::', family: 2},
           hasGateway: false,
           isDefaultRoute: true
-        }],
+        });
+      }
+      const config: vpnExtension.VpnConfig = {
+        addresses: addresses,
+        routes: routes,
         // Relay resolves the virtual address through the host's DNS server.
         dnsAddresses: [this.dnsAddress],
         mtu: 1500,
         isIPv4Accepted: true,
-        isIPv6Accepted: true,
+        isIPv6Accepted: captureIpv6,
         isBlocking: false
       };
       this.tunFd = await this.connection.create(config);
       if (this.stopped || generation !== this.generation) { await this.cleanup(); return; }
-      tether.start(this.tunFd, this.socketFd, this.session);
+      tether.start(this.tunFd, this.socketFd, this.session, this.ipv6Mode as number);
       this.attempts = 0;
       this.publish('connected', '已连接 · 正在通过 USB 共享网络');
-      hilog.info(0x0001, 'HarmonyTether', 'VPN_READY port=%{public}d mtu=1500 dns=%{public}s', this.port, this.dnsAddress);
+      hilog.info(0x0001, 'HarmonyTether', 'VPN_READY port=%{public}d mtu=1500 dns=%{public}s ipv6=%{public}d', this.port, this.dnsAddress, this.ipv6Mode as number);
     } catch (error) {
       const err = error as BusinessError;
       hilog.error(0x0001, 'HarmonyTether', 'VPN_CONNECT_FAILED code=%{public}d message=%{public}s', err.code ?? 0, err.message ?? String(error));
