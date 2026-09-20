@@ -26,9 +26,19 @@ mod datagram;
 mod datagram_buffer;
 #[macro_use]
 mod interrupt;
+#[allow(dead_code)] // Wired into the client/router by the next migration task.
+mod ip_packet;
+#[allow(dead_code)] // Wired into the client/router by the next migration task.
+mod ip_packet_buffer;
 mod ipv4_header;
 mod ipv4_packet;
+#[cfg(test)]
 mod ipv4_packet_buffer;
+#[allow(dead_code)] // Wired into the client/router by the next migration task.
+mod ipv6_header;
+mod ipv6_connection;
+mod ipv6_packet;
+mod ipv6_packetizer;
 mod net;
 mod root_listener;
 mod packet_source;

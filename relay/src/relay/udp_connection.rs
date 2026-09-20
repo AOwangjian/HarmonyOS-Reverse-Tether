@@ -26,9 +26,10 @@ use std::time::Instant;
 use super::binary;
 use super::client::{Client, ClientChannel};
 use super::connection::{Connection, ConnectionId};
+use super::ip_packet::IpPacket;
 use super::datagram_buffer::DatagramBuffer;
 use super::ipv4_header::Ipv4Header;
-use super::ipv4_packet::{Ipv4Packet, MAX_PACKET_LENGTH};
+use super::ipv4_packet::MAX_PACKET_LENGTH;
 use super::packetizer::Packetizer;
 use super::selector::Selector;
 use super::transport_header::TransportHeader;
@@ -262,8 +263,12 @@ impl Connection for UdpConnection {
         &mut self,
         selector: &mut Selector,
         _: &mut ClientChannel,
-        ipv4_packet: &Ipv4Packet,
+        packet: &IpPacket,
     ) {
+        let ipv4_packet = match packet {
+            IpPacket::Ipv4(packet) => packet,
+            IpPacket::Ipv6(_) => return,
+        };
         match self
             .client_to_network
             .read_from(ipv4_packet.payload().expect("No payload"))

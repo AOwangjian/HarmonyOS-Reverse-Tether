@@ -15,11 +15,11 @@
  */
 
 use std::fmt;
-use std::net::SocketAddrV4;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use super::client::ClientChannel;
+use super::ip_packet::IpPacket;
 use super::ipv4_header::{Ipv4HeaderData, Protocol};
-use super::ipv4_packet::Ipv4Packet;
 use super::net;
 use super::selector::Selector;
 use super::transport_header::TransportHeaderData;
@@ -33,7 +33,7 @@ pub trait Connection {
         &mut self,
         selector: &mut Selector,
         client_channel: &mut ClientChannel,
-        ipv4_packet: &Ipv4Packet,
+        packet: &IpPacket,
     );
     fn close(&mut self, selector: &mut Selector);
     /// Called by the reaper when the flow has been idle for too long.
@@ -48,57 +48,65 @@ pub trait Connection {
     fn is_closed(&self) -> bool;
 }
 
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ConnectionId {
     protocol: Protocol,
-    source_ip: u32,
-    source_port: u16,
-    destination_ip: u32,
-    destination_port: u16,
+    source: SocketAddr,
+    destination: SocketAddr,
     id_string: String,
 }
 
-impl PartialEq for ConnectionId {
-    fn eq(&self, other: &Self) -> bool {
-        self.protocol == other.protocol
-            && self.source_ip == other.source_ip
-            && self.source_port == other.source_port
-            && self.destination_ip == other.destination_ip
-            && self.destination_port == other.destination_port
-    }
-}
-
-impl std::hash::Hash for ConnectionId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.protocol.hash(state);
-        self.source_ip.hash(state);
-        self.source_port.hash(state);
-        self.destination_ip.hash(state);
-        self.destination_port.hash(state);
-    }
-}
-
 impl ConnectionId {
+    pub fn new(protocol: Protocol, source: SocketAddr, destination: SocketAddr) -> Self {
+        let id_string = format!("{} -> {}", source, destination);
+        Self {
+            protocol,
+            source,
+            destination,
+            id_string,
+        }
+    }
+
     pub fn from_headers(
         ipv4_header_data: &Ipv4HeaderData,
         transport_header_data: &TransportHeaderData,
     ) -> Self {
-        let source_ip = ipv4_header_data.source();
-        let source_port = transport_header_data.source_port();
-        let destination_ip = ipv4_header_data.destination();
-        let destination_port = transport_header_data.destination_port();
-        let id_string = format!(
-            "{} -> {}",
-            net::to_socket_addr(source_ip, source_port),
-            net::to_socket_addr(destination_ip, destination_port)
-        );
-        Self {
-            protocol: ipv4_header_data.protocol(),
-            source_ip,
-            source_port,
-            destination_ip,
-            destination_port,
-            id_string,
+        Self::new(
+            ipv4_header_data.protocol(),
+            net::to_socket_addr(ipv4_header_data.source(), transport_header_data.source_port())
+                .into(),
+            net::to_socket_addr(
+                ipv4_header_data.destination(),
+                transport_header_data.destination_port(),
+            )
+            .into(),
+        )
+    }
+
+    pub fn from_packet(packet: &IpPacket) -> Option<Self> {
+        match packet {
+            IpPacket::Ipv4(packet) => {
+                let (header, transport) = packet.headers_data();
+                transport.map(|transport| Self::from_headers(header, transport))
+            }
+            IpPacket::Ipv6(packet) => {
+                let header = packet.ipv6_header_data();
+                let transport = packet.transport_header_data();
+                let protocol = match header.next_header() {
+                    6 => Protocol::Tcp,
+                    17 => Protocol::Udp,
+                    _ => return None,
+                };
+                let source = SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::from(header.source())),
+                    transport.source_port(),
+                );
+                let destination = SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::from(header.destination())),
+                    transport.destination_port(),
+                );
+                Some(Self::new(protocol, source, destination))
+            }
         }
     }
 
@@ -106,16 +114,21 @@ impl ConnectionId {
         self.protocol
     }
 
-    pub fn rewritten_destination(&self) -> SocketAddrV4 {
-        if self.destination_ip == crate::dns::VIRTUAL_DNS && self.destination_port == 53 {
-            return crate::dns::upstream();
+    pub fn rewritten_destination(&self) -> SocketAddr {
+        match self.destination {
+            SocketAddr::V4(destination)
+                if u32::from(*destination.ip()) == crate::dns::VIRTUAL_DNS
+                    && destination.port() == 53 =>
+            {
+                crate::dns::upstream().into()
+            }
+            SocketAddr::V4(destination)
+                if u32::from(*destination.ip()) == LOCALHOST_FORWARD =>
+            {
+                net::to_socket_addr(LOCALHOST, destination.port()).into()
+            }
+            _ => self.destination,
         }
-        let ip = if self.destination_ip == LOCALHOST_FORWARD {
-            LOCALHOST
-        } else {
-            self.destination_ip
-        };
-        net::to_socket_addr(ip, self.destination_port)
     }
 }
 
@@ -163,5 +176,34 @@ macro_rules! cx_warn {
 macro_rules! cx_error {
     (target: $target:expr, $id:expr, $($arg:tt)*) => {
         log::error!(target: $target, "{}", cx_format!($id, $($arg)+))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    #[test]
+    fn connection_id_keeps_ipv4_and_ipv6_flows_with_the_same_ports_distinct() {
+        let source_port = 40000;
+        let destination_port = 443;
+        let ipv4 = ConnectionId::new(
+            Protocol::Tcp,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), source_port),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)), destination_port),
+        );
+        let ipv6 = ConnectionId::new(
+            Protocol::Tcp,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), source_port),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), destination_port),
+        );
+
+        assert_ne!(ipv4, ipv6);
+        let mut ids = HashSet::new();
+        ids.insert(ipv4);
+        ids.insert(ipv6);
+        assert_eq!(2, ids.len());
     }
 }

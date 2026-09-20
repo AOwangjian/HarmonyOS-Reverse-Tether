@@ -25,8 +25,9 @@ use std::rc::Rc;
 
 use super::binary;
 use super::close_listener::CloseListener;
+use super::ip_packet::{PacketParseError, UnsupportedPacket};
+use super::ip_packet_buffer::IpPacketBuffer;
 use super::ipv4_packet::{Ipv4Packet, MAX_PACKET_LENGTH};
-use super::ipv4_packet_buffer::Ipv4PacketBuffer;
 use super::packet_source::PacketSource;
 use super::router::Router;
 use super::selector::Selector;
@@ -39,7 +40,7 @@ pub struct Client {
     stream: TcpStream,
     interests: Ready,
     token: Token,
-    client_to_network: Ipv4PacketBuffer,
+    client_to_network: IpPacketBuffer,
     network_to_client: StreamBuffer,
     router: Router,
     close_listener: Box<dyn CloseListener<Client>>,
@@ -79,8 +80,20 @@ impl<'a> ClientChannel<'a> {
         selector: &mut Selector,
         ipv4_packet: &Ipv4Packet,
     ) -> io::Result<()> {
-        if ipv4_packet.length() as usize <= self.network_to_client.remaining() {
-            self.network_to_client.read_from(ipv4_packet.raw());
+        self.send_raw_to_client(selector, ipv4_packet.raw())
+    }
+
+    /// Send an already serialized IP packet, regardless of its address family.
+    ///
+    /// The client link is a byte stream of IP packets, so IPv6 responses travel the
+    /// very same path; only the typed IPv4 wrapper had to be bypassed.
+    pub fn send_raw_to_client(
+        &mut self,
+        selector: &mut Selector,
+        raw: &[u8],
+    ) -> io::Result<()> {
+        if raw.len() <= self.network_to_client.remaining() {
+            self.network_to_client.read_from(raw);
             self.update_interests(selector);
             Ok(())
         } else {
@@ -122,7 +135,7 @@ impl Client {
             stream,
             interests,
             token: Token(0), // default value, will be set afterwards
-            client_to_network: Ipv4PacketBuffer::new(),
+            client_to_network: IpPacketBuffer::new(),
             network_to_client: StreamBuffer::new(16 * MAX_PACKET_LENGTH),
             router: Router::new(),
             closed: false,
@@ -270,8 +283,17 @@ impl Client {
         selector: &mut Selector,
         ipv4_packet: &Ipv4Packet,
     ) -> io::Result<()> {
-        if ipv4_packet.length() as usize <= self.network_to_client.remaining() {
-            self.network_to_client.read_from(ipv4_packet.raw());
+        self.send_raw_to_client(selector, ipv4_packet.raw())
+    }
+
+    /// Send an already serialized IP packet, regardless of its address family.
+    pub fn send_raw_to_client(
+        &mut self,
+        selector: &mut Selector,
+        raw: &[u8],
+    ) -> io::Result<()> {
+        if raw.len() <= self.network_to_client.remaining() {
+            self.network_to_client.read_from(raw);
             self.update_interests(selector);
             Ok(())
         } else {
@@ -310,22 +332,21 @@ impl Client {
 
     fn push_to_network(&mut self, selector: &mut Selector) {
         while self.push_one_packet_to_network(selector) {
-            self.client_to_network.next();
+            match self.client_to_network.next() {
+                Ok(true) => (),
+                Ok(false) => break,
+                Err(error) => {
+                    warn!(target: TAG, "Closing malformed client #{}: {:?}", self.id, error);
+                    self.close(selector);
+                    break;
+                }
+            }
         }
     }
 
     fn push_one_packet_to_network(&mut self, selector: &mut Selector) -> bool {
-        if let Err(error) = self.client_to_network.validate_front() {
-            warn!(target: TAG, "Closing malformed client #{}: {}", self.id, error);
-            self.close(selector);
-            return false;
-        }
-        if self.client_to_network.is_fragmented() {
-            warn!(target: TAG, "Dropping unsupported fragmented IPv4 packet");
-            return true;
-        }
-        match self.client_to_network.as_ipv4_packet() {
-            Some(ref packet) => {
+        match self.client_to_network.packet() {
+            Ok(Some(packet)) => {
                 let mut client_channel = ClientChannel::new(
                     &mut self.network_to_client,
                     &self.stream,
@@ -333,10 +354,23 @@ impl Client {
                     &mut self.interests,
                 );
                 self.router
-                    .send_to_network(selector, &mut client_channel, packet);
+                    .send_to_network(selector, &mut client_channel, &packet);
                 true
             }
-            None => false,
+            Ok(None) => false,
+            Err(PacketParseError::Unsupported(UnsupportedPacket::Ipv4Fragment)) => {
+                warn!(target: TAG, "Dropping unsupported fragmented IPv4 packet");
+                true
+            }
+            Err(PacketParseError::Unsupported(reason)) => {
+                warn!(target: TAG, "Dropping unsupported client packet: {:?}", reason);
+                true
+            }
+            Err(error) => {
+                warn!(target: TAG, "Closing malformed client #{}: {:?}", self.id, error);
+                self.close(selector);
+                false
+            }
         }
     }
 

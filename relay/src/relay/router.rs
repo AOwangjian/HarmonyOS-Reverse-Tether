@@ -23,8 +23,10 @@ use std::rc::{Rc, Weak};
 use super::binary;
 use super::client::{Client, ClientChannel};
 use super::connection::{Connection, ConnectionId};
+use super::ip_packet::IpPacket;
 use super::ipv4_header::Protocol;
-use super::ipv4_packet::Ipv4Packet;
+use super::ipv6_connection::Ipv6Connection;
+use super::ipv6_packetizer::Ipv6Packetizer;
 use super::selector::Selector;
 use super::tcp_connection::TcpConnection;
 use super::udp_connection::UdpConnection;
@@ -56,27 +58,30 @@ impl Router {
         &mut self,
         selector: &mut Selector,
         client_channel: &mut ClientChannel,
-        ipv4_packet: &Ipv4Packet,
+        packet: &IpPacket,
     ) {
-        if !ipv4_packet.is_valid() {
+        let id = match ConnectionId::from_packet(packet) {
+            Some(id) => id,
+            None => {
+                warn!(target: TAG, "Dropping invalid packet");
+                return;
+            }
+        };
+        if matches!(packet, IpPacket::Ipv4(ipv4_packet) if !ipv4_packet.is_valid()) {
             warn!(target: TAG, "Dropping invalid packet");
             if log_enabled!(target: TAG, Level::Trace) {
                 trace!(
                     target: TAG,
                     "{}",
-                    binary::build_packet_string(ipv4_packet.raw())
+                    binary::build_packet_string(packet.raw())
                 );
             }
             return;
         }
 
-        let (ipv4_header_data, transport_header_data) = ipv4_packet.headers_data();
-        let transport_header_data = transport_header_data.expect("No transport");
-        let id = ConnectionId::from_headers(ipv4_header_data, transport_header_data);
-
         let connection_rc = match self.connections.get(&id) {
             Some(rc) => rc.clone(),
-            None => match Self::create_connection(selector, id.clone(), self.client.clone(), ipv4_packet) {
+            None => match Self::create_connection(selector, id.clone(), self.client.clone(), packet) {
                 Ok(rc) => {
                     self.connections.insert(id.clone(), rc.clone());
                     rc
@@ -95,7 +100,7 @@ impl Router {
 
         let closed = {
             let mut connection = connection_rc.borrow_mut();
-            connection.send_to_network(selector, client_channel, ipv4_packet);
+            connection.send_to_network(selector, client_channel, packet);
             connection.is_closed()
         };
 
@@ -109,29 +114,42 @@ impl Router {
         selector: &mut Selector,
         id: ConnectionId,
         client: Weak<RefCell<Client>>,
-        ipv4_packet: &Ipv4Packet,
+        packet: &IpPacket,
     ) -> io::Result<Rc<RefCell<dyn Connection>>> {
-        let (ipv4_header, transport_header) = ipv4_packet.headers();
-        let transport_header = transport_header.expect("No transport");
-        match id.protocol() {
-            Protocol::Tcp => Ok(TcpConnection::create(
-                selector,
-                id,
-                client,
-                ipv4_header,
-                transport_header,
-            )?),
-            Protocol::Udp => Ok(UdpConnection::create(
-                selector,
-                id,
-                client,
-                ipv4_header,
-                transport_header,
-            )?),
-            p => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Unsupported protocol: {:?}", p),
-            )),
+        match packet {
+            IpPacket::Ipv4(ipv4_packet) => {
+                let (ipv4_header, transport_header) = ipv4_packet.headers();
+                let transport_header = transport_header.expect("No transport");
+                match id.protocol() {
+                    Protocol::Tcp => Ok(TcpConnection::create(
+                        selector,
+                        id,
+                        client,
+                        ipv4_header,
+                        transport_header,
+                    )?),
+                    Protocol::Udp => Ok(UdpConnection::create(
+                        selector,
+                        id,
+                        client,
+                        ipv4_header,
+                        transport_header,
+                    )?),
+                    p => Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Unsupported protocol: {:?}", p),
+                    )),
+                }
+            }
+            IpPacket::Ipv6(ipv6_packet) => {
+                // Build the response template from the first packet of the flow, so
+                // every synthesized reply mirrors the client's own endpoints.
+                let packetizer = Ipv6Packetizer::new(
+                    &ipv6_packet.ipv6_header(),
+                    &ipv6_packet.transport_header(),
+                );
+                Ok(Ipv6Connection::create(selector, id, client, packetizer)?)
+            }
         }
     }
 
@@ -193,5 +211,55 @@ impl Router {
             }
         }
         (tcp, udp, other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relay::ip_packet::IpPacket;
+
+    fn ipv6_udp_packet() -> Vec<u8> {
+        let mut raw = vec![0x60, 0, 0, 0, 0, 8, 17, 64];
+        raw.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        raw.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        raw.extend_from_slice(&[0x9c, 0x40, 0x00, 0x09, 0, 8, 0, 0]);
+        raw
+    }
+
+    fn ipv6_tcp_packet() -> Vec<u8> {
+        let mut raw = vec![0x60, 0, 0, 0, 0, 20, 6, 64];
+        raw.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        raw.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        raw.extend_from_slice(&[0x9c, 0x40, 0x00, 0x09]);
+        raw.extend_from_slice(&[0; 8]);
+        raw.extend_from_slice(&[0x50, 0x02, 0, 0, 0, 0, 0, 0]);
+        raw
+    }
+
+    #[test]
+    fn router_creates_an_ipv6_udp_outbound_connection() {
+        let mut raw = ipv6_udp_packet();
+        let packet = IpPacket::parse(&mut raw).unwrap();
+        let id = ConnectionId::from_packet(&packet).unwrap();
+        let mut selector = Selector::create().unwrap();
+
+        let connection = Router::create_connection(&mut selector, id.clone(), Weak::new(), &packet)
+            .unwrap();
+        assert_eq!(&id, connection.borrow().id());
+        connection.borrow_mut().close(&mut selector);
+    }
+
+    #[test]
+    fn router_creates_an_ipv6_tcp_outbound_connection() {
+        let mut raw = ipv6_tcp_packet();
+        let packet = IpPacket::parse(&mut raw).unwrap();
+        let id = ConnectionId::from_packet(&packet).unwrap();
+        let mut selector = Selector::create().unwrap();
+
+        let connection = Router::create_connection(&mut selector, id.clone(), Weak::new(), &packet)
+            .unwrap();
+        assert_eq!(&id, connection.borrow().id());
+        connection.borrow_mut().close(&mut selector);
     }
 }

@@ -28,6 +28,7 @@ use std::time::Instant;
 use super::binary;
 use super::client::{Client, ClientChannel};
 use super::connection::{Connection, ConnectionId};
+use super::ip_packet::IpPacket;
 use super::ipv4_header::Ipv4Header;
 use super::ipv4_packet::{Ipv4Packet, MAX_PACKET_LENGTH};
 use super::packet_source::PacketSource;
@@ -853,8 +854,12 @@ impl Connection for TcpConnection {
         &mut self,
         selector: &mut Selector,
         client_channel: &mut ClientChannel,
-        ipv4_packet: &Ipv4Packet,
+        packet: &IpPacket,
     ) {
+        let ipv4_packet = match packet {
+            IpPacket::Ipv4(packet) => packet,
+            IpPacket::Ipv6(_) => return,
+        };
         self.touch();
         self.handle_packet(selector, client_channel, ipv4_packet);
         if !self.closed {

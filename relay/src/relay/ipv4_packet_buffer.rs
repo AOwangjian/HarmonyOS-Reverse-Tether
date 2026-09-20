@@ -110,9 +110,14 @@ impl Ipv4PacketBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::ip_packet::{IpPacket, PacketParseError, UnsupportedPacket};
+    use crate::relay::ip_packet_buffer::IpPacketBuffer;
+    use crate::relay::ipv6_packetizer::Ipv6Packetizer;
+    use crate::relay::datagram::tests::MockDatagramSocket;
     use crate::relay::ipv4_header::Protocol;
     use crate::relay::transport_header::TransportHeaderData;
     use byteorder::{BigEndian, WriteBytesExt};
+    use std::convert::TryInto;
     use std::io;
 
     #[test]
@@ -273,5 +278,175 @@ mod tests {
         packet_buffer.next();
 
         assert!(packet_buffer.as_ipv4_packet().is_none());
+    }
+
+    fn ipv6_packet(next_header: u8, transport: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(40 + transport.len());
+        raw.extend_from_slice(&[0x60, 0, 0, 0]);
+        raw.write_u16::<BigEndian>(transport.len() as u16).unwrap();
+        raw.write_u8(next_header).unwrap();
+        raw.write_u8(64).unwrap();
+        raw.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        raw.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        raw.extend_from_slice(transport);
+        raw
+    }
+
+    #[test]
+    fn unified_framing_parses_fragmented_ipv6_udp() {
+        let udp = [0x04, 0xd2, 0x16, 0x2e, 0, 12, 0, 0, 0x11, 0x22, 0x33, 0x44];
+        let raw = ipv6_packet(17, &udp);
+        let mut buffer = IpPacketBuffer::new();
+        buffer.read_from(&mut io::Cursor::new(&raw[..40])).unwrap();
+        assert!(buffer.packet().unwrap().is_none());
+
+        buffer.read_from(&mut io::Cursor::new(&raw[40..])).unwrap();
+        match buffer.packet().unwrap().unwrap() {
+            IpPacket::Ipv6(packet) => {
+                let header = packet.ipv6_header();
+                assert_eq!(52, packet.length());
+                assert_eq!(17, header.next_header());
+                assert_eq!(0x20010db8, u32::from_be_bytes(header.source()[..4].try_into().unwrap()));
+                assert_eq!([0x11, 0x22, 0x33, 0x44], packet.payload().unwrap());
+            }
+            IpPacket::Ipv4(_) => panic!("expected an IPv6 packet"),
+        }
+    }
+
+    #[test]
+    fn unified_framing_parses_ipv6_tcp() {
+        let mut tcp = [0; 20];
+        tcp[..4].copy_from_slice(&[0x04, 0xd2, 0x16, 0x2e]);
+        tcp[12] = 0x50;
+        let raw = ipv6_packet(6, &tcp);
+        let mut buffer = IpPacketBuffer::new();
+        buffer.read_from(&mut io::Cursor::new(raw)).unwrap();
+
+        match buffer.packet().unwrap().unwrap() {
+            IpPacket::Ipv6(packet) => {
+                assert_eq!(60, packet.length());
+                let transport = packet.transport_header();
+                assert_eq!(1234, transport.source_port());
+                assert_eq!(5678, transport.destination_port());
+                assert_eq!(Some(&[][..]), packet.payload());
+            }
+            IpPacket::Ipv4(_) => panic!("expected an IPv6 packet"),
+        }
+    }
+
+    #[test]
+    fn unified_framing_accepts_ipv4_dont_fragment_packets() {
+        let mut raw = create_packet();
+        raw[6] = 0x40; // DF only; MF and the fragment offset are clear.
+        let mut buffer = IpPacketBuffer::new();
+        buffer.read_from(&mut io::Cursor::new(raw)).unwrap();
+
+        match buffer.packet().unwrap().unwrap() {
+            IpPacket::Ipv4(packet) => assert_eq!(32, packet.length()),
+            IpPacket::Ipv6(_) => panic!("expected an IPv4 packet"),
+        }
+    }
+
+    #[test]
+    fn unified_framing_accepts_the_largest_non_jumbo_ipv6_udp_packet() {
+        let mut udp = vec![0; u16::MAX as usize];
+        udp[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+        let raw = ipv6_packet(17, &udp);
+        let mut buffer = IpPacketBuffer::new();
+        buffer.read_from(&mut io::Cursor::new(raw)).unwrap();
+
+        match buffer.packet().unwrap().unwrap() {
+            IpPacket::Ipv6(packet) => assert_eq!(40 + u16::MAX as usize, packet.length()),
+            IpPacket::Ipv4(_) => panic!("expected an IPv6 packet"),
+        }
+    }
+
+    #[test]
+    fn unified_framing_reports_ipv6_extension_and_fragment_headers_as_unsupported() {
+        for (next_header, expected) in [
+            (0, UnsupportedPacket::Ipv6ExtensionHeader(0)),
+            (44, UnsupportedPacket::Ipv6FragmentHeader),
+        ] {
+            let raw = ipv6_packet(next_header, &[0; 8]);
+            let mut buffer = IpPacketBuffer::new();
+            buffer.read_from(&mut io::Cursor::new(raw)).unwrap();
+            assert!(matches!(
+                buffer.packet(),
+                Err(PacketParseError::Unsupported(actual)) if actual == expected
+            ));
+            assert!(buffer.next().unwrap());
+        }
+    }
+
+    #[test]
+    fn unified_framing_rejects_malformed_ipv6_transport_without_panicking() {
+        let raw = ipv6_packet(6, &[0; 8]);
+        let mut buffer = IpPacketBuffer::new();
+        buffer.read_from(&mut io::Cursor::new(raw)).unwrap();
+        assert!(matches!(
+            buffer.packet(),
+            Err(PacketParseError::Malformed("truncated TCP header"))
+        ));
+    }
+
+    #[test]
+    fn unified_packet_parser_rejects_short_ipv4_input_without_panicking() {
+        let mut raw = [0x45, 0];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            IpPacket::parse(&mut raw).map(|_| ())
+        }));
+        assert!(matches!(
+            result,
+            Ok(Err(PacketParseError::Malformed("truncated IPv4 packet")))
+        ));
+    }
+
+    #[test]
+    fn ipv6_packetizer_swaps_udp_endpoints_and_writes_a_pseudo_header_checksum() {
+        let input = ipv6_packet(17, &[0x04, 0xd2, 0x16, 0x2e, 0, 8, 0, 0]);
+        let mut input = input;
+        let packet = match IpPacket::parse(&mut input).unwrap() {
+            IpPacket::Ipv6(packet) => packet,
+            IpPacket::Ipv4(_) => panic!("expected an IPv6 packet"),
+        };
+        let header = packet.ipv6_header();
+        let transport = packet.transport_header();
+        let mut packetizer = Ipv6Packetizer::new(&header, &transport);
+        let mut host = MockDatagramSocket::from_data(&[0xaa, 0xbb]);
+        let response = packetizer.packetize(&mut host).unwrap();
+
+        assert_eq!(header.destination(), response.ipv6_header().source());
+        assert_eq!(header.source(), response.ipv6_header().destination());
+        assert_eq!(Some(&[0xaa, 0xbb][..]), response.payload());
+        let raw = response.raw();
+        assert_eq!(10, u16::from_be_bytes([raw[44], raw[45]]));
+        assert_ne!(0, u16::from_be_bytes([raw[46], raw[47]]));
+        assert_eq!(0xffff, checksum_words(&raw[8..24], &raw[24..40], &raw[40..]));
+    }
+
+    fn checksum_words(source: &[u8], destination: &[u8], transport: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for bytes in [source, destination] {
+            for pair in bytes.chunks(2) {
+                sum += u32::from(u16::from_be_bytes([pair[0], pair[1]]));
+            }
+        }
+        let length = transport.len() as u32;
+        sum += length >> 16;
+        sum += length & 0xffff;
+        sum += 17; // next-header UDP
+        for pair in transport.chunks(2) {
+            sum += if pair.len() == 2 {
+                u32::from(u16::from_be_bytes([pair[0], pair[1]]))
+            } else {
+                u32::from(pair[0]) << 8
+            };
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
     }
 }
