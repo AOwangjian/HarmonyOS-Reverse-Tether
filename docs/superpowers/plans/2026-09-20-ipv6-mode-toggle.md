@@ -498,7 +498,26 @@ napi_value Start(napi_env env, napi_callback_info info) {
 }
 ```
 
-- [ ] **Step 2: Verify it compiles**
+- [ ] **Step 2: Update the TypeScript declaration**
+
+ArkTS type-checks `tether.start` against a hand-written declaration, not
+against the C++ — forgetting this file fails the build only in a clean
+workspace, because an incremental build reuses the cached declaration.
+
+In `app/entry/src/main/cpp/types/libtether/index.d.ts`, replace:
+
+```typescript
+export const start: (tunFd: number, socketFd: number, session: number) => void;
+```
+
+with:
+
+```typescript
+// ipv6Mode: 0 = off, 1 = proxy, 2 = blackhole (see common/Ipv6Settings.ets).
+export const start: (tunFd: number, socketFd: number, session: number, ipv6Mode: number) => void;
+```
+
+- [ ] **Step 3: Verify it compiles**
 
 Run:
 ```
@@ -507,10 +526,10 @@ D:\HarmonyOS\command-line-tools-26\command-line-tools\bin\hvigorw.bat --mode mod
 ```
 Expected: `BUILD SUCCESSFUL` with no errors.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add app/entry/src/main/cpp/napi_init.cpp
+git add app/entry/src/main/cpp/napi_init.cpp app/entry/src/main/cpp/types/libtether/index.d.ts
 git commit -m "feat(app): pass the IPv6 mode across the NAPI boundary"
 ```
 
