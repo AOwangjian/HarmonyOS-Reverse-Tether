@@ -7,6 +7,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { VPN_ABILITY, TetherState, loadState } from '../common/State';
 import { hasPrivacyConsent, acceptPrivacy } from '../common/PrivacyConsent';
 import { tetherParameters, clearTetherRequest } from '../common/TetherRequest';
+import { Ipv6Mode, loadIpv6Mode, saveIpv6Mode } from '../common/Ipv6Settings';
 import { PrivacyDialog } from '../components/PrivacyDialog';
 import { AboutView } from '../components/AboutView';
 
@@ -21,6 +22,7 @@ struct Index {
   @State acting: boolean = false;
   @State consent: boolean = false;
   @State selectedTab: number = 0;
+  @State ipv6Mode: Ipv6Mode = Ipv6Mode.Off;
   private navigationStack: NavPathStack = new NavPathStack();
   private timer: number = -1;
   private promptOnShow: boolean = true;
@@ -56,6 +58,7 @@ struct Index {
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
     this.status = loadState(context.filesDir);
     this.consent = hasPrivacyConsent(context.filesDir);
+    this.ipv6Mode = loadIpv6Mode(context.filesDir);
   }
 
   private showPrivacy(): void {
@@ -115,7 +118,32 @@ struct Index {
   }
   private vpnWant(): Want {
     const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    return {bundleName: context.abilityInfo.bundleName, abilityName: VPN_ABILITY, parameters: tetherParameters()};
+    const parameters: Record<string, string> = tetherParameters();
+    parameters['ipv6Mode'] = String(this.ipv6Mode as number);
+    return {bundleName: context.abilityInfo.bundleName, abilityName: VPN_ABILITY, parameters: parameters};
+  }
+
+  private ipv6Subtitle(): string {
+    if (this.ipv6Mode === Ipv6Mode.Blackhole) return '拦截 IPv6 并拒绝，应用将回落 IPv4';
+    if (this.ipv6Mode === Ipv6Mode.Proxy) return 'IPv6 经电脑转发出网';
+    return '系统自行处理 IPv6，可能绕过隧道';
+  }
+
+  private async applyIpv6Mode(mode: Ipv6Mode): Promise<void> {
+    if (this.acting) return;
+    const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    try {
+      saveIpv6Mode(context.filesDir, mode);
+    } catch (_) {
+      this.message = '保存设置失败，请重试。';
+      return;
+    }
+    this.ipv6Mode = mode;
+    // A running tunnel keeps its old routes until it is re-established.
+    if (this.status.state === 'stopped') return;
+    this.message = '正在应用新设置…';
+    await this.stop();
+    await this.start();
   }
   private async probe(): Promise<void> {
     if (this.probing || !this.requireConsent()) return;
@@ -182,6 +210,29 @@ struct Index {
               .fontSize(14).constraintSize({ minHeight: 44 }).onClick(() => this.showPrivacy())
           }
         }.width('100%')
+        Column() {
+          Row() {
+            Column({ space: 4 }) {
+              Text('代理 IPv6').fontSize(16).fontColor($r('sys.color.font_primary'))
+              Text(this.ipv6Subtitle()).fontSize(12).fontColor($r('sys.color.font_secondary')).lineHeight(18)
+            }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.ipv6Mode !== Ipv6Mode.Off })
+              .enabled(!this.acting)
+              .onChange((on: boolean) => this.applyIpv6Mode(on ? Ipv6Mode.Proxy : Ipv6Mode.Off))
+          }.width('100%').padding({ top: 16, bottom: 16, left: 16, right: 16 })
+          if (this.ipv6Mode !== Ipv6Mode.Off) {
+            Divider().color($r('sys.color.comp_divider'))
+            Row() {
+              Column({ space: 4 }) {
+                Text('黑洞模式').fontSize(16).fontColor($r('sys.color.font_primary'))
+                Text('拦截并拒绝所有 IPv6 出站').fontSize(12).fontColor($r('sys.color.font_secondary')).lineHeight(18)
+              }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+              Toggle({ type: ToggleType.Switch, isOn: this.ipv6Mode === Ipv6Mode.Blackhole })
+                .enabled(!this.acting)
+                .onChange((on: boolean) => this.applyIpv6Mode(on ? Ipv6Mode.Blackhole : Ipv6Mode.Proxy))
+            }.width('100%').padding({ top: 16, bottom: 16, left: 32, right: 16 })
+          }
+        }.width('100%').backgroundColor($r('sys.color.comp_background_list_card')).borderRadius(16)
       }.padding({ left: 16, right: 16, top: 16, bottom: 24 }).width('100%').constraintSize({ maxWidth: 600 })
     }.width('100%').height('100%').align(Alignment.Top)
   }
